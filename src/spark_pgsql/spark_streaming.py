@@ -5,12 +5,23 @@ from pyspark.sql.types import (
     StringType,
 )
 from pyspark.sql.functions import from_json, col
-from src.constants import POSTGRES_URL, POSTGRES_PROPERTIES, DB_FIELDS
+from src.constants import (
+    POSTGRES_URL,
+    POSTGRES_PROPERTIES,
+    DB_FIELDS,
+    KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_TOPIC,
+)
 import logging
+import os
 
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s:%(funcName)s:%(levelname)s:%(message)s"
+)
+
+SPARK_CHECKPOINT_LOCATION = os.getenv(
+    "SPARK_CHECKPOINT_LOCATION", "/tmp/spark-checkpoints/rappel_conso"
 )
 
 
@@ -37,8 +48,8 @@ def create_initial_dataframe(spark_session):
         # Gets the streaming data from topic random_names
         df = (
             spark_session.readStream.format("kafka")
-            .option("kafka.bootstrap.servers", "kafka:9092")
-            .option("subscribe", "rappel_conso")
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+            .option("subscribe", KAFKA_TOPIC)
             .option("startingOffsets", "earliest")
             .load()
         )
@@ -86,7 +97,7 @@ def start_streaming(df_parsed, spark):
                 POSTGRES_URL, "rappel_conso_table", "append", properties=POSTGRES_PROPERTIES
             )
         )
-    ).trigger(once=True) \
+    ).option("checkpointLocation", SPARK_CHECKPOINT_LOCATION).trigger(once=True) \
         .start()
 
     return query.awaitTermination()

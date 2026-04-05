@@ -1,8 +1,12 @@
 from src.constants import (
     URL_API,
     PATH_LAST_PROCESSED,
+    DEFAULT_LAST_PROCESSED,
     MAX_LIMIT,
     MAX_OFFSET,
+    KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_BOOTSTRAP_SERVERS_LOCAL,
+    KAFKA_TOPIC,
 )
 
 from .transformations import transform_row
@@ -14,6 +18,7 @@ import requests
 from kafka import KafkaProducer
 from typing import List
 import logging
+from pathlib import Path
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO, force=True)
 
@@ -22,12 +27,17 @@ def get_latest_timestamp():
     """
     Gets the latest timestamp from the last_processed.json file
     """
-    with open(PATH_LAST_PROCESSED, "r") as file:
-        data = json.load(file)
-        if "last_processed" in data:
-            return data["last_processed"]
-        else:
-            return datetime.datetime.min
+    path_last_processed = Path(PATH_LAST_PROCESSED)
+    if not path_last_processed.exists():
+        return DEFAULT_LAST_PROCESSED
+
+    with path_last_processed.open("r", encoding="utf-8") as file:
+        try:
+            data = json.load(file)
+        except json.JSONDecodeError:
+            return DEFAULT_LAST_PROCESSED
+
+    return data.get("last_processed", DEFAULT_LAST_PROCESSED)
 
 
 def update_last_processed_file(data: List[dict]):
@@ -41,7 +51,9 @@ def update_last_processed_file(data: List[dict]):
     ]
     last_processed = max(publication_dates_as_timestamps) - datetime.timedelta(days=1)
     last_processed_as_string = last_processed.strftime("%Y-%m-%d")
-    with open(PATH_LAST_PROCESSED, "w") as file:
+    path_last_processed = Path(PATH_LAST_PROCESSED)
+    path_last_processed.parent.mkdir(parents=True, exist_ok=True)
+    with path_last_processed.open("w", encoding="utf-8") as file:
         json.dump({"last_processed": last_processed_as_string}, file)
 
 
@@ -52,7 +64,8 @@ def get_all_data(last_processed_timestamp: datetime.datetime) -> List[dict]:
         # The publication date must be greater than the last processed timestamp and the offset (n_results)
         # corresponds to the number of results already processed.
         url = URL_API.format(last_processed_timestamp, n_results)
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
         data = response.json()
         current_results = data["results"]
         full_data.extend(current_results)
@@ -103,13 +116,13 @@ def create_kafka_producer():
     Creates the Kafka producer object
     """
     try:
-        producer = KafkaProducer(bootstrap_servers=["kafka:9092"])
+        producer = KafkaProducer(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS])
     except kafka.errors.NoBrokersAvailable:
         logging.info(
             "We assume that we are running locally, so we use localhost instead of kafka and the external "
             "port 9094"
         )
-        producer = KafkaProducer(bootstrap_servers=["localhost:9094"])
+        producer = KafkaProducer(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS_LOCAL])
 
     return producer
 
@@ -122,7 +135,9 @@ def stream():
     results = query_data()
     kafka_data_full = map(process_data, results)
     for kafka_data in kafka_data_full:
-        producer.send("rappel_conso", json.dumps(kafka_data).encode("utf-8"))
+        producer.send(KAFKA_TOPIC, json.dumps(kafka_data).encode("utf-8"))
+    producer.flush()
+    producer.close()
 
 
 if __name__ == "__main__":

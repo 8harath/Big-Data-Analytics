@@ -1,3 +1,5 @@
 FROM apache/airflow:2.7.3
 
-RUN pip install --no-cache-dir "apache-airflow==${AIRFLOW_VERSION}" kafka_python==2.0.2 unidecode==1.3.7
+COPY airflow_resources/requirements-airflow.txt /tmp/requirements-airflow.txt
+
+RUN pip install --no-cache-dir -r /tmp/requirements-airflow.txt

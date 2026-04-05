@@ -32,6 +32,23 @@ services:
     networks:
       - airflow-kafka
 
+  spark-app:
+    image: rappel-conso/spark:latest
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile
+    command: ["sleep", "infinity"]
+    environment:
+      APP_POSTGRES_HOST: ${APP_POSTGRES_HOST:-postgres}
+      APP_POSTGRES_PORT: ${APP_POSTGRES_PORT:-5432}
+      APP_POSTGRES_DB: ${APP_POSTGRES_DB:-airflow}
+      APP_POSTGRES_USER: ${APP_POSTGRES_USER:-airflow}
+      APP_POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD:-airflow}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-rappel_conso}
+    networks:
+      - airflow-kafka
+
   docker-proxy:
     image: alpine/socat
     command: "TCP4-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock"
@@ -45,4 +62,5 @@ services:
 
 networks:
   airflow-kafka:
-    external: true
+    name: airflow-kafka
+    driver: bridge

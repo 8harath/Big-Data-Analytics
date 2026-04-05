@@ -1,17 +1,33 @@
-# Building a simple End-to-End Data Engineering System 
-This project uses different tools such as kafka, airflow, spark, postgres and docker. 
+# End-to-End Data Engineering Pipeline with Kafka, Spark, Airflow, and PostgreSQL
 
-A step by step guide to run this pipeline: https://medium.com/@hamzagharbi_19502/end-to-end-data-engineering-system-on-real-data-with-kafka-spark-airflow-postgres-and-docker-a70e18df4090
+This repository implements a local end-to-end streaming data pipeline around the French public `RappelConso` product-recall dataset. It ingests recall records from a government API, publishes them to Kafka, processes them with Spark Structured Streaming, stores the final rows in PostgreSQL, and orchestrates the flow with Airflow.
 
-## Overview
+## Quick Summary
 
-1. Data Streaming: Initially, data is streamed from the API into a Kafka topic.
-  
-2. Data Processing: A Spark job then takes over, consuming the data from the Kafka topic and transferring it to a PostgreSQL database.
-   
-3. Scheduling with Airflow: Both the streaming task and the Spark job are orchestrated using Airflow. While in a real-world scenario, the Kafka producer would constantly listen to the API, for demonstration purposes, we'll schedule the Kafka streaming task to run daily. Once the streaming is complete, the Spark job processes the data, making it ready for use by the LLM application.
+1. A Python producer pulls recall data from the `RappelConso` API.
+2. The producer normalizes and publishes those records to a Kafka topic.
+3. Spark reads the Kafka topic and writes deduplicated rows into PostgreSQL.
+4. Airflow coordinates table creation, ingestion, and Spark execution.
+5. Docker Compose runs the local infrastructure.
 
-All of these tools will be built and run using docker, and more specifically docker-compose.
+## Main Tool
+
+If you need to present the repository around one Big Data tool for an academic submission, use **Apache Spark** as the primary tool. Kafka, Airflow, PostgreSQL, and Docker are supporting technologies in the surrounding ecosystem.
+
+## Full Documentation
+
+The complete technical guide is available in [PROJECT_GUIDE.md](PROJECT_GUIDE.md).
+
+It covers:
+
+- project purpose
+- dataset details
+- repository structure
+- architecture and data flow
+- setup and run instructions
+- commands to execute
+- troubleshooting and extension ideas
+
+## Architecture
 
 ![chatuml-diagram](https://github.com/HamzaG737/data-engineering-project/assets/71135893/ce92b731-038a-4d9c-9722-f97a6ba51153)
-

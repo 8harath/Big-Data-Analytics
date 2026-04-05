@@ -54,13 +54,23 @@ x-airflow-common:
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${APP_POSTGRES_USER:-airflow}:${APP_POSTGRES_PASSWORD:-airflow}@postgres/${APP_POSTGRES_DB:-airflow}
     # For backward compatibility, with Airflow <2.3
-    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${APP_POSTGRES_USER:-airflow}:${APP_POSTGRES_PASSWORD:-airflow}@postgres/${APP_POSTGRES_DB:-airflow}
     AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    APP_POSTGRES_HOST: ${APP_POSTGRES_HOST:-postgres}
+    APP_POSTGRES_PORT: ${APP_POSTGRES_PORT:-5432}
+    APP_POSTGRES_DB: ${APP_POSTGRES_DB:-airflow}
+    APP_POSTGRES_USER: ${APP_POSTGRES_USER:-airflow}
+    APP_POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD:-airflow}
+    KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+    KAFKA_BOOTSTRAP_SERVERS_LOCAL: ${KAFKA_BOOTSTRAP_SERVERS_LOCAL:-localhost:9094}
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-rappel_conso}
+    LAST_PROCESSED_PATH: ${LAST_PROCESSED_PATH:-/opt/airflow/data/last_processed.json}
+    PYTHONPATH: /opt/airflow/dags
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
@@ -70,9 +80,10 @@ x-airflow-common:
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ./airflow_resources/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ./scripts:/opt/airflow/dags/scripts
     - ./src:/opt/airflow/dags/src
     - ./data/last_processed.json:/opt/airflow/data/last_processed.json
   user: "${AIRFLOW_UID:-50000}:0"
@@ -87,13 +98,15 @@ services:
   postgres:
     image: postgres:13
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: ${APP_POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${APP_POSTGRES_DB:-airflow}
+    ports:
+      - "5432:5432"
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${APP_POSTGRES_USER:-airflow}"]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -229,7 +242,8 @@ services:
 
 networks:
   airflow-kafka:
-    external: true
+    name: airflow-kafka
+    driver: bridge
 
 volumes:
   postgres-db-volume:

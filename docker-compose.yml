@@ -46,6 +46,7 @@ services:
       APP_POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD:-airflow}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-rappel_conso}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-rappel_conso_dlq}
     networks:
       - airflow-kafka
 

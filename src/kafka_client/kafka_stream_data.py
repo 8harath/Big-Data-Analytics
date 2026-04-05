@@ -7,16 +7,19 @@ from src.constants import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_BOOTSTRAP_SERVERS_LOCAL,
     KAFKA_TOPIC,
+    KAFKA_DLQ_TOPIC,
 )
 
 from .transformations import transform_row
+from .schema import RappelConsoRecord
 
 import kafka.errors
 import json
 import datetime
 import requests
 from kafka import KafkaProducer
-from typing import List
+from pydantic import ValidationError
+from typing import List, Tuple
 import logging
 from pathlib import Path
 
@@ -25,7 +28,8 @@ logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO, forc
 
 def get_latest_timestamp():
     """
-    Gets the latest timestamp from the last_processed.json file
+    Gets the latest timestamp from the last_processed.json file.
+    Returns DEFAULT_LAST_PROCESSED if the file is missing or malformed.
     """
     path_last_processed = Path(PATH_LAST_PROCESSED)
     if not path_last_processed.exists():
@@ -35,6 +39,10 @@ def get_latest_timestamp():
         try:
             data = json.load(file)
         except json.JSONDecodeError:
+            logging.warning(
+                "last_processed.json contains invalid JSON — falling back to "
+                f"DEFAULT_LAST_PROCESSED ({DEFAULT_LAST_PROCESSED})."
+            )
             return DEFAULT_LAST_PROCESSED
 
     return data.get("last_processed", DEFAULT_LAST_PROCESSED)
@@ -42,8 +50,10 @@ def get_latest_timestamp():
 
 def update_last_processed_file(data: List[dict]):
     """
-    Updates the last_processed.json file with the latest timestamp. Since the comparison is strict
-    on the field date_de_publication, we set the new last_processed day to the latest timestamp minus one day.
+    Updates the last_processed.json file with the latest timestamp.
+    Sets the new last_processed day to the latest timestamp minus one day
+    so that records published on the boundary date are re-queried on the
+    next run and de-duplicated by the Spark anti-join.
     """
     publication_dates_as_timestamps = [
         datetime.datetime.strptime(row["date_de_publication"], "%Y-%m-%d")
@@ -72,11 +82,10 @@ def get_all_data(last_processed_timestamp: datetime.datetime) -> List[dict]:
         n_results += len(current_results)
         if len(current_results) < MAX_LIMIT:
             break
-        # The sum of offset + limit API parameter must be lower than 10000.
+        # The sum of offset + limit must stay below 10 000 (API cap).
+        # When the cap is about to be hit, roll forward the date window and
+        # reset the offset so we continue from where the API left off.
         if n_results + MAX_LIMIT >= MAX_OFFSET:
-            # If it is the case, change the last_processed_timestamp parameter to the date_de_publication
-            # of the last retrieved result, minus one day. In case of duplicates, they will be filtered
-            # in the deduplicate_data function. We also reset n_results (or the offset parameter) to 0.
             last_timestamp = current_results[-1]["date_de_publication"]
             timestamp_as_date = datetime.datetime.strptime(last_timestamp, "%Y-%m-%d")
             timestamp_as_date = timestamp_as_date - datetime.timedelta(days=1)
@@ -84,18 +93,16 @@ def get_all_data(last_processed_timestamp: datetime.datetime) -> List[dict]:
             n_results = 0
 
     logging.info(f"Got {len(full_data)} results from the API")
-
     return full_data
 
 
 def deduplicate_data(data: List[dict]) -> List[dict]:
+    """Remove within-batch duplicates keyed on reference_fiche."""
     return list({v["reference_fiche"]: v for v in data}.values())
 
 
 def query_data() -> List[dict]:
-    """
-    Queries the data from the API
-    """
+    """Fetch, deduplicate, and update state. Returns raw API rows."""
     last_processed = get_latest_timestamp()
     full_data = get_all_data(last_processed)
     full_data = deduplicate_data(full_data)
@@ -104,40 +111,95 @@ def query_data() -> List[dict]:
     return full_data
 
 
-def process_data(row):
-    """
-    Processes the data from the API
-    """
+def process_data(row: dict) -> dict:
+    """Apply all column transformations to a single raw API row."""
     return transform_row(row)
 
 
-def create_kafka_producer():
+def validate_record(record: dict) -> Tuple[bool, list]:
     """
-    Creates the Kafka producer object
+    Validate a transformed record against the RappelConsoRecord Pydantic schema.
+
+    Returns
+    -------
+    (True, [])           — record is valid; safe to publish to main topic.
+    (False, [errors])    — record is invalid; should be routed to DLQ.
+                           errors is the list of Pydantic ValidationError
+                           detail dicts (field, message, type).
+    """
+    try:
+        RappelConsoRecord(**record)
+        return True, []
+    except ValidationError as exc:
+        return False, exc.errors()
+
+
+def create_kafka_producer() -> KafkaProducer:
+    """
+    Create and return a KafkaProducer.
+
+    Tries the internal bootstrap address first (container-to-container).
+    Falls back to the external localhost address when running outside Docker.
     """
     try:
         producer = KafkaProducer(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS])
     except kafka.errors.NoBrokersAvailable:
         logging.info(
-            "We assume that we are running locally, so we use localhost instead of kafka and the external "
-            "port 9094"
+            "Internal Kafka address unreachable — assuming local execution, "
+            f"falling back to {KAFKA_BOOTSTRAP_SERVERS_LOCAL}."
         )
         producer = KafkaProducer(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS_LOCAL])
-
     return producer
 
 
 def stream():
     """
-    Writes the API data to Kafka topic rappel_conso
+    Full ingestion pipeline:
+
+    1. Fetch new records from the RappelConso API (incremental).
+    2. Deduplicate within the batch.
+    3. Transform each record.
+    4. Validate each transformed record with Pydantic:
+       - Valid   -> publish to KAFKA_TOPIC       (rappel_conso)
+       - Invalid -> publish to KAFKA_DLQ_TOPIC   (rappel_conso_dlq)
+                    with original record + validation errors + timestamp.
+    5. Flush and close the producer.
     """
     producer = create_kafka_producer()
     results = query_data()
-    kafka_data_full = map(process_data, results)
-    for kafka_data in kafka_data_full:
-        producer.send(KAFKA_TOPIC, json.dumps(kafka_data).encode("utf-8"))
+
+    valid_count = 0
+    invalid_count = 0
+
+    for raw_record in results:
+        transformed = process_data(raw_record)
+        is_valid, errors = validate_record(transformed)
+
+        if is_valid:
+            producer.send(KAFKA_TOPIC, json.dumps(transformed).encode("utf-8"))
+            valid_count += 1
+        else:
+            dlq_message = {
+                "original_record": transformed,
+                "validation_errors": errors,
+                "failed_at": datetime.datetime.utcnow().isoformat(),
+                "source_topic": KAFKA_TOPIC,
+            }
+            producer.send(KAFKA_DLQ_TOPIC, json.dumps(dlq_message).encode("utf-8"))
+            invalid_count += 1
+            logging.warning(
+                f"Record {transformed.get('reference_fiche', '<unknown>')} failed "
+                f"validation and was routed to DLQ ({KAFKA_DLQ_TOPIC}). "
+                f"Errors: {errors}"
+            )
+
     producer.flush()
     producer.close()
+
+    logging.info(
+        f"Stream complete — valid: {valid_count} -> {KAFKA_TOPIC} | "
+        f"invalid: {invalid_count} -> {KAFKA_DLQ_TOPIC}"
+    )
 
 
 if __name__ == "__main__":

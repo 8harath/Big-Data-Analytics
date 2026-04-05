@@ -6,6 +6,8 @@
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
+27. [Data Quality Layer — Pydantic Validation and Dead-Letter Queue](#27-data-quality-layer--pydantic-validation-and-dead-letter-queue)
+28. [Previously Undocumented Implementation Details](#28-previously-undocumented-implementation-details)
 2. [Project Background and Motivation](#2-project-background-and-motivation)
 3. [Dataset: RappelConso in Depth](#3-dataset-rappelconso-in-depth)
 4. [System Architecture Overview](#4-system-architecture-overview)
@@ -1207,6 +1209,193 @@ The design reflects the real concerns of production data engineering: not just "
 Apache Spark is the central component — the engine that takes a raw event stream from Kafka, applies a structured schema, performs a distributed join against existing data, and writes clean records to the database. The surrounding ecosystem (Kafka, Airflow, PostgreSQL, Docker) is not decoration but a practical demonstration of how Spark fits into a real pipeline architecture, bounded by a message queue on one side and a relational database on the other, coordinated by an orchestration layer that enforces execution order and provides operational visibility.
 
 The project is explicitly scoped to local development. It trades production concerns like high availability, cluster-level Spark, and cloud infrastructure for clarity, reproducibility, and pedagogical completeness. Every design decision is documented here with its rationale, and the known limitations are stated honestly. The combination makes this project both a functional data engineering system and a transparent record of the choices that shaped it.
+
+---
+
+---
+
+## 27. Data Quality Layer — Pydantic Validation and Dead-Letter Queue
+
+### The problem this solves
+
+Before this layer was added, the pipeline had a silent failure mode. If the RappelConso API returned a record with a null or missing `reference_fiche`, that record would be published to Kafka, consumed by Spark, and written to PostgreSQL — where the primary key constraint would raise an exception, rolling back the entire JDBC batch. Every subsequent record in that batch would be lost. Alternatively, if the API changed the format of `date_de_publication` from `YYYY-MM-DD` to something else, `update_last_processed_file()` would crash with an unhandled `ValueError` from `strptime`, failing the entire `kafka_data_stream` task without updating the state file, causing the next day's run to re-fetch the same data.
+
+The data quality layer catches both classes of failure before a single invalid record reaches Kafka, and routes invalid records to a dedicated dead-letter topic where they can be inspected, corrected, and replayed without affecting the main pipeline.
+
+### Architecture of the validation layer
+
+```
+transform_row(raw_record)
+        |
+        v
+validate_record(transformed)
+        |
+    ----+----
+    |       |
+  VALID   INVALID
+    |       |
+    v       v
+KAFKA_TOPIC  KAFKA_DLQ_TOPIC
+rappel_conso  rappel_conso_dlq
+    |
+    v
+Spark consumer
+    |
+    v
+PostgreSQL
+```
+
+Valid records flow through the existing pipeline unchanged. Invalid records are wrapped in a structured DLQ envelope and published to `rappel_conso_dlq` instead of being silently dropped or crashing the pipeline.
+
+### File: src/kafka_client/schema.py
+
+This new file defines the `RappelConsoRecord` Pydantic model. It uses Pydantic v1 syntax (`pydantic>=1.10.0,<2.0.0`) for compatibility with Apache Airflow 2.7.3, which depends on Pydantic v1 and enforces that constraint in its own package metadata.
+
+**The model defines all 25 DB_FIELDS as typed fields:**
+
+- `reference_fiche: str` — the only truly required field, with no default. Pydantic will raise a `ValidationError` if this field is missing from the record dictionary.
+- All other 24 fields are `Optional[str] = None`. They accept a string, `None`, or absence from the dictionary (which defaults to `None`).
+
+**Three validators enforce format contracts:**
+
+`reference_fiche_non_empty` — checks that the primary key is not an empty string or whitespace-only string after stripping. An empty `reference_fiche` passes Python's type check (`""` is a `str`) but would insert an empty primary key into PostgreSQL, corrupting the uniqueness invariant.
+
+`publication_date_format` — checks that `date_de_publication`, when present, matches the regex `^\d{4}-\d{2}-\d{2}$`. This is the exact format expected by `datetime.strptime(..., "%Y-%m-%d")` in `update_last_processed_file()`. A mismatch here would otherwise cause the state file update to fail after records have already been published to Kafka, leaving the pipeline in an inconsistent state where Kafka has messages but the state file was not advanced.
+
+`commercialisation_date_format` — checks that the two parsed commercialization date fields, when present, match `^\d{2}/\d{2}/\d{4}$` (the DD/MM/YYYY output of `separate_commercialisation_dates()`). A mismatch indicates the regex in the transformation layer produced unexpected output.
+
+**The `Config` class sets `extra = "ignore"`**, meaning that if the API response adds new fields in the future that `normalize_columns()` does not filter out, those extra fields are silently ignored rather than raising a validation error. This is the appropriate default: new API fields should be detected as a new API schema version (and handled by updating the model), but they should not break the existing pipeline for all other records.
+
+### validate_record() function in kafka_stream_data.py
+
+```python
+def validate_record(record: dict) -> Tuple[bool, list]:
+    try:
+        RappelConsoRecord(**record)
+        return True, []
+    except ValidationError as exc:
+        return False, exc.errors()
+```
+
+`exc.errors()` returns a list of dictionaries, one per validation failure. Each dict contains:
+- `loc`: tuple of field names indicating where the error occurred
+- `msg`: human-readable error message
+- `type`: Pydantic error type string (e.g., `"value_error"`, `"type_error.none.not_allowed"`)
+
+This structured error output is what gets stored in the DLQ message, making it possible to query the DLQ topic in Kafka UI and immediately understand which field failed and why.
+
+### Dead-letter queue message structure
+
+Every invalid record published to `rappel_conso_dlq` has this envelope structure:
+
+```json
+{
+  "original_record": {
+    "reference_fiche": "",
+    "date_de_publication": "2024-03-15",
+    "...": "..."
+  },
+  "validation_errors": [
+    {
+      "loc": ["reference_fiche"],
+      "msg": "reference_fiche is the primary key and must be a non-empty string",
+      "type": "value_error"
+    }
+  ],
+  "failed_at": "2024-03-16T08:32:11.445Z",
+  "source_topic": "rappel_conso"
+}
+```
+
+`original_record` is the full transformed record so that engineers can see exactly what was ingested from the API. `validation_errors` is the Pydantic error list. `failed_at` is a UTC ISO-8601 timestamp for correlation with Airflow logs. `source_topic` records which topic the record was intended for, which is useful if multiple pipelines share the same DLQ topic in future.
+
+### The DLQ topic: rappel_conso_dlq
+
+Kafka auto-creates topics when a producer first sends to them (auto-create is enabled by default in the `soldevelo/kafka` image). The `rappel_conso_dlq` topic is therefore created automatically on the first pipeline run that encounters a validation failure. No manual Kafka administration is required.
+
+The DLQ topic name is configurable via the `KAFKA_DLQ_TOPIC` environment variable (defaulting to `rappel_conso_dlq`), which is now defined in `.env.example`, `constants.py`, and the `docker-compose.yml` `spark-app` environment block.
+
+### Logging behaviour
+
+For every record routed to the DLQ, a `logging.warning()` call is emitted with the `reference_fiche` (or `<unknown>` if that field itself is missing), the target DLQ topic, and the full error list. This means invalid records are visible in the Airflow task logs without requiring the operator to separately inspect the Kafka DLQ topic.
+
+At the end of every `stream()` call, a `logging.info()` summary line reports the total valid and invalid counts and their respective topics:
+
+```
+Stream complete — valid: 847 -> rappel_conso | invalid: 2 -> rappel_conso_dlq
+```
+
+This gives operators an at-a-glance signal of the data quality of each ingestion run.
+
+### Pydantic version constraint
+
+`pydantic>=1.10.0,<2.0.0` is now explicit in both `requirements.txt` and `airflow_resources/requirements-airflow.txt`. Pydantic v2 introduced breaking changes to the validator API (`@validator` became `@field_validator`, `class Config` became `model_config`, and error format changed). Since Airflow 2.7.3 has a hard `<2.0.0` upper bound on Pydantic in its own dependency resolution, using v1 syntax avoids installation conflicts. The schema is written entirely in v1-compatible syntax so it will install and run correctly inside the Airflow container.
+
+---
+
+## 28. Previously Undocumented Implementation Details
+
+### The role of __init__.py files
+
+The repository contains `__init__.py` files in four directories: `src/`, `src/kafka_client/`, `scripts/`, and `airflow_resources/`. These files, even when empty, serve a critical function: they declare the directory as a Python package, enabling relative and absolute imports.
+
+Without `src/__init__.py`, the import `from src.constants import KAFKA_TOPIC` in `kafka_stream_data.py` would raise a `ModuleNotFoundError`. Without `src/kafka_client/__init__.py`, the relative import `from .transformations import transform_row` inside `kafka_stream_data.py` would fail. Without `scripts/__init__.py`, the Airflow DAG's `from scripts.create_table import create_table` would fail at import time, preventing the DAG from loading.
+
+The Airflow compose file volume-mounts `./scripts` into `/opt/airflow/dags/scripts` and `./src` into `/opt/airflow/dags/src`, placing both packages on the Python path that Airflow uses to resolve DAG imports. The `__init__.py` files make this resolution work.
+
+### The config/ and logs/ directories
+
+Both `config/` and `logs/` are empty directories in the repository (tracked only via a `.gitkeep` file in some projects, or simply present as empty directories). Their presence is load-bearing:
+
+`logs/` is volume-mounted into the Airflow containers at `/opt/airflow/logs`. Airflow writes task execution logs — every line of stdout and stderr from each task run — into this directory, organized by DAG ID, run ID, and task ID. Without this directory, the volume mount would fail silently on some Docker versions, and Airflow log collection would break, making debugging impossible.
+
+`config/` is volume-mounted into the Airflow containers at `/opt/airflow/config`. Airflow looks here for a custom `airflow.cfg` file that overrides defaults. The directory is currently empty (using built-in Airflow defaults), but the mount is declared so that operators can drop a custom config file without modifying the compose file.
+
+### Kafka KRaft environment variables explained
+
+The `soldevelo/kafka` image uses the Bitnami Kafka environment variable naming convention (`KAFKA_CFG_*`). The six KRaft-specific variables and their exact purposes:
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `KAFKA_CFG_NODE_ID` | `0` | Unique integer identifier for this broker/controller node within the cluster. In a multi-node cluster, each node has a distinct ID. |
+| `KAFKA_CFG_PROCESS_ROLES` | `controller,broker` | Combined mode: this single node acts as both a KRaft controller (manages cluster metadata) and a broker (handles produce/consume). Requires no separate controller nodes. |
+| `KAFKA_CFG_LISTENERS` | `PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094` | The three listener sockets the broker opens: internal (9092), controller consensus (9093), and external/host (9094). |
+| `KAFKA_CFG_ADVERTISED_LISTENERS` | `PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094` | The addresses that clients are told to connect to. Containers use `kafka:9092` (DNS resolves within Docker); host-machine clients use `localhost:9094` (mapped by Docker port publishing). The `CONTROLLER` listener is intentionally absent — it is internal-only and never advertised to clients. |
+| `KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP` | `CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT` | Maps each listener name to its security protocol. All three use `PLAINTEXT` (no TLS, no authentication), appropriate for a local development environment. |
+| `KAFKA_CFG_CONTROLLER_QUORUM_VOTERS` | `0@kafka:9093` | Defines the KRaft quorum: voter ID `0` at address `kafka:9093`. In a single-node cluster this is just the node itself. In a multi-node cluster this list would include all controller-role nodes. |
+| `KAFKA_CFG_CONTROLLER_LISTENER_NAMES` | `CONTROLLER` | Tells Kafka which listener name to use for inter-controller Raft communication. Must match one of the names in `KAFKA_CFG_LISTENERS`. |
+
+### JDBC write properties in Spark
+
+The `POSTGRES_PROPERTIES` dictionary in `constants.py`:
+
+```python
+POSTGRES_PROPERTIES = {
+    "user": POSTGRES_USER,
+    "password": POSTGRES_PASSWORD,
+    "driver": "org.postgresql.Driver",
+}
+```
+
+This dictionary is passed as the `properties` argument to both Spark's `spark.read.jdbc()` (when reading the existing table for the anti-join) and `DataFrame.write.jdbc()` (when writing new rows). The three keys have specific meanings in the Spark JDBC connector:
+
+`user` and `password` — the PostgreSQL credentials. Spark passes these as connection properties to the JDBC driver. They are read from environment variables that are injected into the Spark container by the Airflow DockerOperator.
+
+`driver` — fully qualified class name of the JDBC driver to load. Spark uses this to locate the driver JAR downloaded via `spark.jars.packages`. Without this explicit class name, Spark would attempt to auto-detect the driver from the JDBC URL prefix, which can fail if multiple JDBC drivers are on the classpath.
+
+The `POSTGRES_URL` is the JDBC connection string in the format `jdbc:postgresql://{host}:{port}/{db}`. Spark uses this URL together with `POSTGRES_PROPERTIES` to establish the connection. Inside the Spark container, `APP_POSTGRES_HOST` resolves to `postgres` (the Docker service name), which is reachable because the Spark container is attached to the `airflow-kafka` network.
+
+### Error handling edge cases in the producer
+
+**API timeout.** `requests.get(url, timeout=30)` raises `requests.exceptions.Timeout` if the API does not respond within 30 seconds. This exception is not caught inside `get_all_data()` and propagates up to the Airflow task, which marks it as failed and retries once (per the DAG's `retries=1` setting). The state file is not updated on a failed run, so the next retry re-fetches from the same date window.
+
+**API HTTP errors.** `response.raise_for_status()` converts 4xx and 5xx HTTP responses into `requests.exceptions.HTTPError`. Same propagation and retry behaviour as timeout.
+
+**Malformed API JSON.** If the API returns a 200 response with non-JSON body, `response.json()` raises `json.JSONDecodeError`. This also propagates to Airflow for retry.
+
+**Corrupt last_processed.json.** If the file exists but contains invalid JSON (e.g., it was partially written during a prior crash), `json.load()` raises `json.JSONDecodeError`. This is now caught explicitly: a warning is logged, and the function falls back to `DEFAULT_LAST_PROCESSED`. The pipeline re-fetches the full history on the next run; the Spark anti-join prevents duplicates.
+
+**Kafka flush failure.** `producer.flush()` blocks until all buffered messages are delivered or the configured delivery timeout is reached. If Kafka becomes unavailable between `producer.send()` calls and `producer.flush()`, some messages may not be delivered. The state file was already updated before the send loop, so the next run will not re-fetch those records. This is a known gap: in a production system, the state file update would happen after confirmed delivery, not before.
 
 ---
 

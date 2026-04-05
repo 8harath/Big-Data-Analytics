@@ -22,6 +22,7 @@ URL_API = URL_API.format(MAX_LIMIT, "{}", "{}")
 
 # Kafka params
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "rappel_conso")
+KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "rappel_conso_dlq")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_BOOTSTRAP_SERVERS_LOCAL = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS_LOCAL", "localhost:9094"

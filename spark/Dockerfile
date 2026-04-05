@@ -1,9 +1,7 @@
-FROM bitnami/spark:3.5.0
+FROM spark:3.5.7-java17-python3
 
 
-WORKDIR /opt/bitnami/spark
-
-RUN pip install --no-cache-dir py4j
+WORKDIR /opt/spark
 
 COPY ./src/spark_pgsql/spark_streaming.py ./spark_streaming.py
 COPY ./src/constants.py ./src/constants.py

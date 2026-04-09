@@ -122,6 +122,31 @@ hr.rule { border: none; border-top: 2px solid currentColor; opacity: 0.1; margin
   font-family: 'Outfit', sans-serif; font-size: 16px; line-height: 1.65; opacity: 0.72;
 }
 
+/* ── PORTRAIT WARNING (mobile only) ─────────────────────────── */
+#portrait-warn {
+  display: none;
+  position: fixed; inset: 0; z-index: 99999;
+  background: var(--ink); color: var(--paper);
+  flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+  text-align: center; padding: 40px;
+}
+@media (hover: none) and (pointer: coarse) and (orientation: portrait) {
+  #portrait-warn { display: flex; }
+}
+
+/* ── MOBILE TAP ZONES ────────────────────────────────────────── */
+/* Full-viewport invisible tap targets — shown only on touch devices */
+#tap-prev, #tap-next {
+  display: none;
+  position: fixed; top: 0; bottom: 0; z-index: 7000;
+  -webkit-tap-highlight-color: transparent;
+}
+#tap-prev { left: 0; width: 50%; }
+#tap-next { right: 0; width: 50%; }
+@media (hover: none) and (pointer: coarse) {
+  #tap-prev, #tap-next { display: block; }
+}
+
 /* config block — dark-on-paper or paper-on-dark */
 .cfg {
   display: flex; flex-direction: column; min-height: 0;
@@ -959,6 +984,17 @@ hr.rule { border: none; border-top: 2px solid currentColor; opacity: 0.1; margin
 
 <div id="progress"></div>
 
+<!-- portrait warning — only visible on mobile in portrait orientation -->
+<div id="portrait-warn">
+  <div style="font-family:'Bebas Neue',sans-serif; font-size:48px; letter-spacing:3px; line-height:1;">Rotate Device</div>
+  <div style="font-family:'Outfit',sans-serif; font-size:18px; opacity:0.5; letter-spacing:1px;">This presentation is optimised for landscape</div>
+  <div style="font-size:52px; margin-top:8px; opacity:0.4;">&#8635;</div>
+</div>
+
+<!-- full-viewport tap zones for mobile — left = prev, right = next -->
+<div id="tap-prev"></div>
+<div id="tap-next"></div>
+
 <script>
 (function () {
   var TOTAL  = 11;
@@ -977,6 +1013,11 @@ hr.rule { border: none; border-top: 2px solid currentColor; opacity: 0.1; margin
   }
   scale();
   window.addEventListener('resize', scale);
+
+  // Lock to landscape on mobile devices that support it
+  if (screen.orientation && screen.orientation.lock) {
+    screen.orientation.lock('landscape').catch(function(){});
+  }
 
   function go(n) {
     if (n < 0 || n >= TOTAL || n === curr) return;
@@ -1002,19 +1043,15 @@ hr.rule { border: none; border-top: 2px solid currentColor; opacity: 0.1; margin
     }
   });
 
+  // Desktop: click left/right half of stage to navigate
   stage.addEventListener('click', function (e) {
     var r = stage.getBoundingClientRect();
     if ((e.clientX - r.left) / r.width > 0.5) go(curr + 1); else go(curr - 1);
   });
 
-  var tx = null;
-  document.addEventListener('touchstart', function (e) { tx = e.touches[0].clientX; }, { passive: true });
-  document.addEventListener('touchend',   function (e) {
-    if (tx === null) return;
-    var dx = e.changedTouches[0].clientX - tx;
-    if (Math.abs(dx) > 50) { dx < 0 ? go(curr + 1) : go(curr - 1); }
-    tx = null;
-  }, { passive: true });
+  // Mobile: full-viewport tap zones (left = prev, right = next)
+  document.getElementById('tap-prev').addEventListener('click', function () { go(curr - 1); });
+  document.getElementById('tap-next').addEventListener('click', function () { go(curr + 1); });
 
   prog.style.width = '0%';
 })();

@@ -372,6 +372,10 @@ The DockerOperator in Airflow requires the Spark image to be pre-built on the ho
 docker build -f spark/Dockerfile -t rappel-conso/spark:latest .
 ```
 
+Keep the final `.` on the same line. That `.` is the Docker build context. If you see `docker: 'docker buildx build' requires 1 argument`, Docker did not receive the context argument.
+
+With BuildKit enabled, a successful build may end with `naming to docker.io/rappel-conso/spark:latest` and `DONE` rather than the older `Successfully tagged ...` output.
+
 ### 4. Start the infrastructure stack (Kafka, Kafka UI, Docker proxy)
 
 ```bash
